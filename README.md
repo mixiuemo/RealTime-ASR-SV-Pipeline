@@ -27,13 +27,13 @@
 
 
 📂 项目结构
-Plaintext
-.
-├── models/                  # 存放导出的 ONNX 模型文件
-├── speaker_db/              # 声纹底库（每个文件夹一个名字，内存放 WAV 片段）
-├── captured_audio/          # 系统运行过程中自动捕获的语音
-├── funnano_vad_speaker.py   # Python 核心后端脚本
-└── index.html               # WebSocket 实时监控大屏前端
+    Plaintext
+    .
+    ├── models/                  # 存放导出的 ONNX 模型文件
+    ├── speaker_db/              # 声纹底库（每个文件夹一个名字，内存放 WAV 片段）
+    ├── captured_audio/          # 系统运行过程中自动捕获的语音
+    ├── funnano_vad_speaker.py   # Python 核心后端脚本
+    └── index.html               # WebSocket 实时监控大屏前端
 
 🚀 快速开始
 1. 环境配置
