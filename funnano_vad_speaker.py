@@ -7,314 +7,321 @@ import time
 import numpy as np
 import pyaudio
 import shutil 
-import subprocess  # 【新增】：用于调用 ffmpeg
+import wave
+import os
+import json
+from websockets.sync.server import serve
+import subprocess
 from pathlib import Path
 
-# ========================= 全局队列与状态 =========================
+# ========================= 核心配置 =========================
+MODEL_DIR = "./models/sherpa-onnx-funasr-nano-int8-2025-12-30"
+VAD_MODEL = "./models/silero_vad.onnx"
+SV_MODEL = "./models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+SPEAKER_DB_DIR = "./speaker_db"
+SAVE_DIR = "./captured_audio"
+
+# 策略参数 
+HARD_TRUNCATE_SEC = 5.0 
+HARD_TRUNCATE_SAMPLES = int(16000 * HARD_TRUNCATE_SEC)
+SV_WINDOW_SAMPLES = int(2.0 * 16000)
+SILENCE_THRESHOLD_S = 0.85 # 闭嘴 850ms 判定结算
+SV_THRESHOLD = 0.48        # 声纹判定阈值
+
+# 全局通信与同步
 audio_queue = queue.Queue()       
-final_task_queue = queue.Queue()  
-print_lock = threading.Lock()     
+ws_queue = queue.Queue()          
+connected_clients = set()
+clients_lock = threading.Lock()
+buffer_lock = threading.Lock() 
+print_lock = threading.Lock()
+
 killed = False
 
-shared_preview_lines = 0  
-NOISE_WORDS = {"/sil", "嗯", "嗯。", "啊", "啊。", "。", "，", "呃", ""}
-
-# ========================= 音频万能解码器 =========================
-def load_audio_with_ffmpeg(file_path, target_sr=16000, normalize=True):
-    """
-    加强版万能解码器：支持格式转换 + 重采样 + 自动音量归一化
-    """
-    command = [
-        'ffmpeg',
-        '-i', str(file_path),
-        '-f', 'f32le',         
-        '-acodec', 'pcm_f32le',
-        '-ac', '1',            
-        '-ar', str(target_sr), 
-        '-loglevel', 'quiet',  
-        '-'                    
-    ]
+# ========================= 1. 基础工具函数 =========================
+def save_wav(audio_data, file_path):
     try:
-        pipe = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        audio_data = np.frombuffer(pipe.stdout, dtype=np.float32)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        samples = np.array(audio_data)
+        # 归一化，防止破音
+        max_val = np.max(np.abs(samples))
+        if max_val > 0.01: samples *= (0.9 / max_val)
         
-        # ==========================================
-        # 【新增】：极速矩阵级峰值归一化 (Peak Normalization)
-        # ==========================================
-        if normalize and len(audio_data) > 0:
-            max_amp = np.max(np.abs(audio_data))
-            # 只有当音量不是完全静音，且确实需要调整时才处理
-            if max_amp > 0.0:
-                # 0.9 是安全余量(Headroom)，防止大模型底层计算时溢出破音
-                audio_data = audio_data * (0.9 / max_amp) 
-                
-        return audio_data, target_sr
+        pcm_samples = (samples * 32767).astype(np.int16)
+        with wave.open(file_path, 'wb') as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+            wf.writeframes(pcm_samples.tobytes())
     except Exception as e:
-        print(f"  [错误] 无法解码音频文件 {file_path}，详细: {e}")
-        return None, None
+        print(f"写入文件失败: {e}")
 
-# ========================= 声纹特征算法 =========================
-def compute_similarity(emb1, emb2):
-    return np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+def load_audio_ffmpeg(file_path):
+    cmd = ['ffmpeg', '-i', str(file_path), '-f', 'f32le', '-acodec', 'pcm_f32le', 
+           '-ac', '1', '-ar', '16000', '-loglevel', 'quiet', '-']
+    try:
+        pipe = subprocess.run(cmd, stdout=subprocess.PIPE, check=True)
+        return np.frombuffer(pipe.stdout, dtype=np.float32)
+    except: return None
 
-def init_speaker_db(extractor, db_dir):
-    """启动时：读取文件夹，按人物提取平均声纹特征"""
-    speaker_db = {}
-    db_path = Path(db_dir)
-    if not db_path.exists():
-        print(f"\n[系统提示] 找不到声纹底库文件夹 {db_dir}，当前为无底库模式。\n")
-        return speaker_db
+# ========================= 2. ChannelManager (核心逻辑类) =========================
+class ChannelManager:
+    def __init__(self, recognizer, extractor, speaker_db):
+        self.recognizer = recognizer
+        self.extractor = extractor
+        self.speaker_db = speaker_db
         
-    print(f"正在从 {db_dir} 加载声纹底库...")
-    
-    # 【改动】：遍历一级目录（按人名分类的文件夹）
-    for speaker_folder in db_path.iterdir():
-        if not speaker_folder.is_dir():
-            continue
+        # --- 核心状态位  ---
+        self.locked_speaker = None
+        self.locked_score = 0.0
+        self.sv_confirmed_this_turn = False
+        self.settled_final_text = ""      
+        self.accumulated_session_text = "" 
+        self.last_speech_time = time.time()
+        
+        self.preview_audio_buffer = []    
+        self.last_sv_check_time = 0
+        self.last_preview_time = 0
+        
+    def reset(self, deep=False):
+        """ deepReset"""
+        self.settled_final_text = ""
+        self.accumulated_session_text = ""
+        with buffer_lock: self.preview_audio_buffer = []
+        if deep:
+            self.locked_speaker = None
+            self.locked_score = 0.0
+            self.sv_confirmed_this_turn = False
+            self.last_speech_time = time.time()
+            with print_lock:
+                print("\n\033[94m♻️ [系统] 深度重置，等待下一轮对话...\033[0m")
+
+    def push_samples(self, samples):
+        now = time.time()
+        self.last_speech_time = now
+        
+        with buffer_lock:
+            self.preview_audio_buffer.extend(samples.tolist())
+            buf_size = len(self.preview_audio_buffer)
+
+        # 1. 硬截断积木 (5s)
+        if buf_size >= HARD_TRUNCATE_SAMPLES:
+            self.process_buffer(is_truncated=True)
+            return
+
+        # 2. 滑动声纹识别 (1.5s 窗口)
+        if not self.sv_confirmed_this_turn and buf_size >= SV_WINDOW_SAMPLES:
+            if (now - self.last_sv_check_time) > 1.2:
+                self.last_sv_check_time = now
+                snapshot = np.array(self.preview_audio_buffer[-SV_WINDOW_SAMPLES:])
+                threading.Thread(target=self.identify_speaker_task, args=(snapshot,)).start()
+
+        # 3. 实时预览推送
+        if (now - self.last_preview_time) > 0.6:
+            self.last_preview_time = now
+            with buffer_lock: snapshot = np.array(self.preview_audio_buffer)
+            threading.Thread(target=self.do_preview, args=(snapshot,)).start()
+
+    def identify_speaker_task(self, audio):
+        """识别并透传分值"""
+        if not self.speaker_db: return
+        try:
+            s = self.extractor.create_stream(); s.accept_waveform(16000, audio)
+            emb = np.array(self.extractor.compute(s))
             
-        speaker_name = speaker_folder.name
-        embeddings = []
-        
-        # 遍历该人名文件夹下的所有音频文件
-        for audio_file in speaker_folder.iterdir():
-            if audio_file.name.startswith('.'): # 忽略隐藏文件（如 Mac 的 .DS_Store）
-                continue
+            best_name, max_s = "陌生人", 0.0
+            for name, db_emb in self.speaker_db.items():
+                score = np.dot(emb, db_emb) / (np.linalg.norm(emb) * np.linalg.norm(db_emb))
+                if score > max_s: max_s = score; best_name = name
+            
+            final_score = round(float(max_s), 2)
+            
+            # 如果分值达到门槛，执行锁定
+            if max_s >= SV_THRESHOLD:
+                self.locked_speaker = best_name
+                self.locked_score = final_score
+                if not best_name.startswith("OP_"): # 非话务员即锁定正主
+                    self.sv_confirmed_this_turn = True
+                self.send_to_ws("speaker_id", "", best_name, final_score)
+            else:
+                self.send_to_ws("speaker_id", "", "陌生人", final_score)
+        except Exception as e:
+            print(f"声纹识别线程异常: {e}")
+
+    def do_preview(self, audio):
+        """执行预览 ASR 并推送到 WebSocket"""
+        try:
+            stream = self.recognizer.create_stream()
+            stream.accept_waveform(16000, audio)
+            self.recognizer.decode_stream(stream)
+            text = stream.result.text.strip()
+            
+            if text and text not in ["嗯", "啊", "呃", "。"]:
+                self.accumulated_session_text = text
+                full_display = self.settled_final_text + self.accumulated_session_text
+                spk = self.locked_speaker if self.locked_speaker else "识别中..."
+                score = self.locked_score
                 
-            # 使用万能解码器读取
-            audio, sample_rate = load_audio_with_ffmpeg(audio_file)
-            if audio is not None and len(audio) > 0:
-                stream = extractor.create_stream()
-                stream.accept_waveform(sample_rate, audio)
-                emb = extractor.compute(stream)
-                embeddings.append(np.array(emb))
-        
-        # 【核心逻辑】：如果这个人有多段音频，将它们的特征相加求平均，得到最稳健的灵魂声纹
-        if embeddings:
-            mean_embedding = np.mean(embeddings, axis=0)
-            speaker_db[speaker_name] = mean_embedding
-            print(f"  - 注册成功: {speaker_name} (综合了 {len(embeddings)} 段音频)")
-        else:
-            print(f"  - 注册跳过: {speaker_name} (文件夹内没有有效音频)")
-            
-    return speaker_db
+                # WebSocket 实时推
+                self.send_to_ws("preview", full_display, spk, score)
+                
+                # 控制台实时显
+                with print_lock:
+                    sys.stdout.write(f"\r\033[K\033[90m[预览 - {spk}({score})] {full_display}\033[0m")
+                    sys.stdout.flush()
+        except: pass
 
-def identify_speaker(extractor, speaker_db, audio_data, threshold=0.45):
-    """实战期：识别当前说话人"""
-    if not speaker_db:
-        return "未知说话人"
+    def process_buffer(self, is_truncated):
+        """核心修复：区分‘片段结算’与‘最终结案’"""
+        with buffer_lock:
+            if not self.preview_audio_buffer: return
+            segment = np.array(self.preview_audio_buffer)
+            self.preview_audio_buffer = []
         
-    stream = extractor.create_stream()
-    stream.accept_waveform(16000, audio_data)
-    curr_embedding = np.array(extractor.compute(stream))
-    
-    best_name = "未知说话人"
-    best_score = -1.0
-    
-    for name, db_embedding in speaker_db.items():
-        score = compute_similarity(curr_embedding, db_embedding)
-        if score > best_score:
-            best_score = score
-            best_name = name
-            
-    if best_score < threshold:
-        return f"陌生人(相似度:{best_score:.2f})"
+        stream = self.recognizer.create_stream()
+        stream.accept_waveform(16000, segment)
+        self.recognizer.decode_stream(stream)
+        text = stream.result.text.strip()
         
-    return f"{best_name}({best_score:.2f})"
+        if text and text not in ["嗯", "啊", "呃", "。"]:
+            self.settled_final_text += text
+            spk, score = (self.locked_speaker, self.locked_score) if self.locked_speaker else ("识别中...", 0.0)
 
-# ========================= 以下为主程序 (基本不变) =========================
-def record_audio_thread():
-    pa = pyaudio.PyAudio()
-    chunk_size = 1024 
-    stream = pa.open(
-        format=pyaudio.paFloat32,
-        channels=1,
-        rate=16000,
-        input=True,
-        frames_per_buffer=chunk_size
-    )
+            # 🚩 修改点：如果是 VAD 断句，发 preview 以便前端更新同一行，不准起新行
+            if is_truncated:
+                msg_type = "truncate"
+            else:
+                msg_type = "preview" 
+
+            self.send_to_ws(msg_type, self.settled_final_text, spk, score)
+            
+            # 存音逻辑不变
+            save_wav(segment, f"{SAVE_DIR}/{spk}_{int(time.time()*1000)}.wav")
+            
+            with print_lock:
+                sys.stdout.write("\r\033[K")
+                color = "33" if is_truncated else "36" # 片段结算用青色区别
+                label = "积木切片" if is_truncated else "片段结算"
+                print(f"\033[1;{color}m[{label} - {spk}({score})] {self.settled_final_text}\033[0m")
+
+    def send_to_ws(self, msg_type, text, speaker, score=0.0):
+        ws_queue.put({
+            "type": msg_type,
+            "channel": "Python-Pro-ASR",
+            "speaker": speaker,
+            "score": score,
+            "text": text
+        })
+
+# ========================= 3. 服务线程组 =========================
+def ws_server_thread():
+    """WebSocket 连接管理 (同步 Server 模式)"""
+    def handler(ws):
+        with clients_lock: connected_clients.add(ws)
+        try:
+            for _ in ws: pass
+        except: pass
+        finally:
+            with clients_lock: connected_clients.discard(ws)
+
+    print("🌐 [WS] WebSocket 服务正在启动 (Port: 8081)")
+    with serve(handler, "0.0.0.0", 8081) as server:
+        server.serve_forever()
+
+def ws_broadcaster():
+    """WebSocket 消息分发员"""
     while not killed:
         try:
-            data = stream.read(chunk_size, exception_on_overflow=False)
-            samples = np.frombuffer(data, dtype=np.float32)
-            audio_queue.put(samples)
-        except Exception:
-            pass
-    stream.stop_stream()
-    stream.close()
-    pa.terminate()
+            msg = ws_queue.get(timeout=0.1)
+            msg_str = json.dumps(msg)
+            with clients_lock:
+                for c in list(connected_clients):
+                    try: c.send(msg_str)
+                    except: connected_clients.discard(c)
+        except queue.Empty: continue
 
-def final_decode_thread(recognizer, extractor, speaker_db):
-    global shared_preview_lines
-    accumulated_final_text = ""  
-    
+def watchdog_thread(manager):
+    """只有看门狗负责发 FINAL 信号"""
     while not killed:
-        try:
-            pure_audio, is_truncated = final_task_queue.get(timeout=1)
+        time.sleep(0.1)
+        silence_duration = time.time() - manager.last_speech_time
+        
+        # 闭嘴 850ms 且已经有确定的文字积木了
+        if silence_duration > SILENCE_THRESHOLD_S and manager.settled_final_text:
+            # 1. 检查 buffer 里是否还有最后一点“尾巴”没结算
+            manager.process_buffer(is_truncated=False)
             
-            f_stream = recognizer.create_stream()
-            f_stream.accept_waveform(16000, pure_audio)
-            recognizer.decode_stream(f_stream)
-            f_text = f_stream.result.text.strip()
-            
-            speaker_identity = "未知"
-            if len(pure_audio) > 8000:
-                speaker_identity = identify_speaker(extractor, speaker_db, pure_audio)
-            
-            if f_text and (f_text not in NOISE_WORDS):
-                accumulated_final_text += f_text
+            # 2. 🚩 唯一发送 FINAL 信号的地方
+            if manager.settled_final_text:
+                final_spk = manager.locked_speaker if manager.locked_speaker else "未知"
+                final_score = manager.locked_score
+                
+                # 发送结案通知
+                manager.send_to_ws("final", manager.settled_final_text, final_spk, final_score)
                 
                 with print_lock:
-                    if shared_preview_lines > 0:
-                        sys.stdout.write(f"\033[{shared_preview_lines}A")
-                    
-                    sys.stdout.write("\r\033[J")
-                    
-                    if is_truncated:
-                        print(f"\033[1;33m  [自动切片 - {speaker_identity}] {accumulated_final_text}...\033[0m\n")
-                    else:
-                        print(f"\033[1;32m  [本句完毕 - {speaker_identity}] {accumulated_final_text}\033[0m\n")
-                    
-                    shared_preview_lines = 0
+                    print(f"\033[1;32m[✅ 最终结案 - {final_spk}({final_score})] {manager.settled_final_text}\033[0m")
             
-            if not is_truncated:
-                accumulated_final_text = ""
-                
-        except queue.Empty:
-            pass
+            # 3. 彻底重置
+            manager.reset(deep=True)
 
+# ========================= 4. 主程序入口 =========================
 def main():
-    MODEL_DIR = "./models/sherpa-onnx-funasr-nano-int8-2025-12-30"
-    VAD_MODEL = "./models/silero_vad.onnx"
-    SV_MODEL = "./models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
-    SPEAKER_DB_DIR = "./speaker_db"
+    print("正在初始化 FunASR + Campplus 语音引擎...")
+    asr_conf = {"encoder_adaptor": f"{MODEL_DIR}/encoder_adaptor.int8.onnx", "llm": f"{MODEL_DIR}/llm.int8.onnx", 
+                "embedding": f"{MODEL_DIR}/embedding.int8.onnx", "tokenizer": f"{MODEL_DIR}/Qwen3-0.6B"}
     
-    PREVIEW_INTERVAL = 1.0     
-    MAX_SPEECH_SEC = 8.0       
+    try:
+        recognizer = sherpa_onnx.OfflineRecognizer.from_funasr_nano(**asr_conf, num_threads=4)
+        extractor = sherpa_onnx.SpeakerEmbeddingExtractor(sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=SV_MODEL, num_threads=2))
+        vad = sherpa_onnx.VoiceActivityDetector(sherpa_onnx.VadModelConfig(
+            silero_vad=sherpa_onnx.SileroVadModelConfig(model=VAD_MODEL, threshold=0.45, max_speech_duration=30.0), 
+            sample_rate=16000))
+    except Exception as e:
+        print(f"❌ 引擎加载失败，请检查模型路径: {e}"); return
 
-    asr_config = {
-        "encoder_adaptor": f"{MODEL_DIR}/encoder_adaptor.int8.onnx",
-        "llm": f"{MODEL_DIR}/llm.int8.onnx",
-        "embedding": f"{MODEL_DIR}/embedding.int8.onnx",
-        "tokenizer": f"{MODEL_DIR}/Qwen3-0.6B",
-    }
+    # 加载声纹底库
+    path = Path(SPEAKER_DB_DIR)
+    speaker_db = {}
+    if path.exists():
+        for folder in path.iterdir():
+            if folder.is_dir():
+                embs = []
+                for f in folder.iterdir():
+                    audio = load_audio_ffmpeg(f)
+                    if audio is not None:
+                        s = extractor.create_stream(); s.accept_waveform(16000, audio)
+                        embs.append(np.array(extractor.compute(s)))
+                if embs: 
+                    speaker_db[folder.name] = np.mean(embs, axis=0)
+                    print(f"  ✅ 声纹注册: {folder.name}")
 
-    print("正在初始化 双轨ASR + 声纹SV 融合引擎...")
+    manager = ChannelManager(recognizer, extractor, speaker_db)
+
+    # 启动后台任务
+    threading.Thread(target=ws_server_thread, daemon=True).start()
+    threading.Thread(target=ws_broadcaster, daemon=True).start()
+    threading.Thread(target=watchdog_thread, args=(manager,), daemon=True).start()
     
-    vad_config = sherpa_onnx.VadModelConfig(
-        silero_vad=sherpa_onnx.SileroVadModelConfig(
-            model=VAD_MODEL,
-            threshold=0.6,             
-            min_speech_duration=0.25,  
-            min_silence_duration=1.0,  
-            max_speech_duration=MAX_SPEECH_SEC,   
-        ),
-        sample_rate=16000,
-    )
-    vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=60)
-    
-    official_hotwords = "财务处,张处长,李主任,新殿光,张三,李四"
-    
-    recognizer_preview = sherpa_onnx.OfflineRecognizer.from_funasr_nano(
-        **asr_config,
-        num_threads=2, 
-        system_prompt="查号台助手，仅转写文字。",
-        hotwords=official_hotwords,
-    )
+    # 麦克风流
+    pa = pyaudio.PyAudio()
+    mic = pa.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
 
-    recognizer_final = sherpa_onnx.OfflineRecognizer.from_funasr_nano(
-        **asr_config,
-        num_threads=4, 
-        system_prompt="查号台助手，仅转写文字，不要解释。",
-        hotwords=official_hotwords,
-    )
-
-    sv_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-        model=SV_MODEL,
-        num_threads=2,
-        debug=False,
-    )
-    speaker_extractor = sherpa_onnx.SpeakerEmbeddingExtractor(sv_config)
-    
-    speaker_db = init_speaker_db(speaker_extractor, SPEAKER_DB_DIR)
-
-    global killed
-    threading.Thread(target=record_audio_thread, daemon=True).start()
-    threading.Thread(target=final_decode_thread, args=(recognizer_final, speaker_extractor, speaker_db), daemon=True).start()
-
-    full_audio_buffer = []           
-    preview_chunk_buffer = []        
-    session_preview_text = ""        
-    
-    last_preview_time = time.time()
-    global shared_preview_lines
-
-    print("\n" + "━"*65)
-    print("  查号系统 ASR + SV (语音识别 + 听音辨人版) 已启动")
-    print(f"  已挂载声纹库人数: {len(speaker_db)} 人")
-    print("━"*65 + "\n")
+    print("\n" + "━"*65 + "\n  Python ChannelManager Pro 已上线 (监听中...)\n" + "━"*65 + "\n")
 
     try:
-        while True:
-            try:
-                samples = audio_queue.get(timeout=0.05)
-                full_audio_buffer = np.concatenate([full_audio_buffer, samples])
-                preview_chunk_buffer = np.concatenate([preview_chunk_buffer, samples])
-                vad.accept_waveform(samples)
-            except queue.Empty:
-                pass
-
-            if not vad.is_speech_detected():
-                if len(full_audio_buffer) > 16000:
-                    full_audio_buffer = full_audio_buffer[-16000:]
-                if len(preview_chunk_buffer) > 16000:
-                    preview_chunk_buffer = preview_chunk_buffer[-16000:]
+        while not killed:
+            data = mic.read(1024, exception_on_overflow=False)
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            vad.accept_waveform(samples)
 
             if vad.is_speech_detected():
-                curr_time = time.time()
-                if curr_time - last_preview_time > PREVIEW_INTERVAL:
-                    
-                    if len(preview_chunk_buffer) > 0:
-                        p_stream = recognizer_preview.create_stream()
-                        p_stream.accept_waveform(16000, np.array(preview_chunk_buffer))
-                        recognizer_preview.decode_stream(p_stream)
-                        p_text = p_stream.result.text.strip()
-                        
-                        if p_text and (p_text not in NOISE_WORDS):
-                            session_preview_text += p_text
-                            
-                            term_width = shutil.get_terminal_size().columns
-                            display_width = sum(2 if ord(c) > 127 else 1 for c in session_preview_text) + 12
-                            current_lines = (display_width - 1) // term_width if display_width > 0 else 0
-                            
-                            with print_lock:
-                                if shared_preview_lines > 0:
-                                    sys.stdout.write(f"\033[{shared_preview_lines}A")
-                                sys.stdout.write("\r\033[J")
-                                print(f"\033[90m  [预览中] {session_preview_text}\033[0m", end="", flush=True)
-                                shared_preview_lines = current_lines
-                        
-                        preview_chunk_buffer = []
-                            
-                    last_preview_time = curr_time
+                manager.push_samples(samples)
 
             while not vad.empty():
-                segment = vad.front 
-                
-                duration_sec = len(segment.samples) / 16000.0
-                is_truncated = duration_sec >= (MAX_SPEECH_SEC - 0.1)
-                
-                final_task_queue.put((segment.samples, is_truncated))
-                
+                # VAD 回调结算
+                manager.process_buffer(is_truncated=False)
                 vad.pop()
-                full_audio_buffer = [] 
-                preview_chunk_buffer = [] 
                 
-                if not is_truncated:
-                    session_preview_text = "" 
+    except KeyboardInterrupt: pass
+    finally: mic.stop_stream(); mic.close(); pa.terminate()
 
-    except KeyboardInterrupt:
-        killed = True
-        print("\n\n[系统消息] 退出程序")
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

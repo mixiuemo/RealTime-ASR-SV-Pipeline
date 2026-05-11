@@ -13,13 +13,11 @@ msgpack==1.1.2
 numba==0.65.1
 numpy==2.2.6
 onnx==1.21.0
-packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1777103621/work
 platformdirs==4.9.6
 pooch==1.9.0
 protobuf==7.34.1
 PyAudio==0.2.14
 pycparser==3.0
-pynini @ file:///Users/runner/miniforge3/conda-bld/pynini_1762534238050/work
 requests==2.33.1
 scikit-learn==1.7.2
 scipy==1.15.3
