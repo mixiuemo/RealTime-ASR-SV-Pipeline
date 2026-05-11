@@ -37,24 +37,25 @@
 ```
 
 🚀 快速开始
+注：需确保系统已安装 ffmpeg 并添加到环境变量。
 1. 环境配置
-    建议使用 Conda 创建独立环境：
-    Bash
-    conda create -n sheronnx python=3.10
-    conda activate sheronnx
-    pip install -r requirements.txt
+建议使用 Conda 创建独立环境：
+Bash
+conda create -n sheronnx python=3.10
+conda activate sheronnx
+pip install -r requirements.txt
 
-    注：需确保系统已安装 ffmpeg 并添加到环境变量。
+
 
 2. 放置模型
-    将模型文件放置在 models 目录下，确保路径与脚本内配置一致：
-    sherpa-onnx-funasr-nano-int8-2025-12-30 
-    silero_vad.onnx
-    3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+将模型文件放置在 models 目录下，确保路径与脚本内配置一致：
+sherpa-onnx-funasr-nano-int8-2025-12-30 
+silero_vad.onnx
+3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
 
 3. 运行系统
-    Bash
-    python funnano_vad_speaker.py
+Bash
+python funnano_vad_speaker.py
 
 4. 开启监控大屏
     直接用浏览器打开 index.html。系统默认监听 8081 端口。
