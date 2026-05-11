@@ -36,11 +36,12 @@
 └── index.html               # WebSocket 实时监控大屏前端
 ```
 
-🚀 快速开始
-注：需确保系统已安装 ffmpeg 并添加到环境变量。
-1. 环境配置
+## 🚀 快速开始
+> 注：需确保系统已安装 ffmpeg 并添加到环境变量。
+
+### 1. 环境配置
 建议使用 Conda 创建独立环境：
-Bash
+```bash
 conda create -n sheronnx python=3.10
 conda activate sheronnx
 pip install -r requirements.txt
@@ -49,22 +50,18 @@ pip install -r requirements.txt
 
 2. 放置模型
 将模型文件放置在 models 目录下，确保路径与脚本内配置一致：
-sherpa-onnx-funasr-nano-int8-2025-12-30 
+sherpa-onnx-funasr-nano-int8-2025-12-30
 silero_vad.onnx
 3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
 
 3. 运行系统
-Bash
 python funnano_vad_speaker.py
 
 4. 开启监控大屏
-    直接用浏览器打开 index.html。系统默认监听 8081 端口。
-
+直接用浏览器打开 index.html。系统默认监听 8081 端口。
 ⚙️ 关键参数
-    BLOCK_SIZE_SEC	5.0	强制切片时间，控制实时积木的长度
-    SV_THRESHOLD	0.48	声纹相似度门槛，高于此值才进行身份锁定
-    SILENCE_THRESHOLD_S	0.85	判定一句话彻底结束的静音时长
-
+BLOCK_SIZE_SEC = 5.0：强制切片时间，控制实时积木的长度
+SV_THRESHOLD = 0.48：声纹相似度门槛，高于此值才进行身份锁定
+SILENCE_THRESHOLD_S = 0.85：判定一句话彻底结束的静音时长
 声纹更新：若需添加新成员，只需在 speaker_db 下新建文件夹并放入其 16k 采样率的 WAV 文件，重启系统即可自动加载，后续考虑增加数据库，直接从数据库读取。
-
-日志说明：控制台绿色代表 [最终结案]，黄色代表 [积木切片]。
+日志说明：控制台绿色代表【最终结案】，黄色代表【积木切片】。
