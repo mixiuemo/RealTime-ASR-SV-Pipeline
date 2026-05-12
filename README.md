@@ -1,4 +1,5 @@
-<img width="2908" height="1782" alt="ScreenShot_2026-05-12_091751_425" src="https://github.com/user-attachments/assets/6ca662a4-1254-4b2a-8ebc-78b0bae72c3d" />
+<img width="2046" height="1536" alt="微信图片_2026-05-12_094126_599" src="https://github.com/user-attachments/assets/28f8426d-99bb-4c06-a8d5-a93176a885a9" />
+
 # RealTime-ASR-SV-Pipeline
 本项目是一个基于 sherpa-onnx 框架实现的语音调度系统。它集成了 ASR (自动语音识别) 与 SV (声纹识别) 技术，采用了类似 Java 高并发架构的状态机管理逻辑。
 
