@@ -13,6 +13,8 @@ import json
 from websockets.sync.server import serve
 import subprocess
 from pathlib import Path
+import collections
+
 
 # ========================= 核心配置 =========================
 MODEL_DIR = "./models/sherpa-onnx-funasr-nano-int8-2025-12-30"
@@ -296,7 +298,6 @@ def main():
 
     manager = ChannelManager(recognizer, extractor, speaker_db)
 
-    # 启动后台任务
     threading.Thread(target=ws_server_thread, daemon=True).start()
     threading.Thread(target=ws_broadcaster, daemon=True).start()
     threading.Thread(target=watchdog_thread, args=(manager,), daemon=True).start()
@@ -307,6 +308,9 @@ def main():
 
     print("\n" + "━"*65 + "\n  Python ChannelManager Pro 已上线 (监听中...)\n" + "━"*65 + "\n")
 
+    # 修复 2：预卷缓冲（Pre-roll Buffer），保留 VAD 触发前的最近 5 帧 (约320ms)
+    pre_roll_buffer = collections.deque(maxlen=5)
+
     try:
         while not killed:
             data = mic.read(1024, exception_on_overflow=False)
@@ -314,11 +318,20 @@ def main():
             vad.accept_waveform(samples)
 
             if vad.is_speech_detected():
+                # 补偿逻辑：如果刚开口，把之前缓存的“字头”全推给 ASR，防止吞字
+                if pre_roll_buffer:
+                    for s in pre_roll_buffer:
+                        manager.push_samples(s)
+                    pre_roll_buffer.clear()
+                
+                # 正常推送当前音频
                 manager.push_samples(samples)
+            else:
+                pre_roll_buffer.append(samples)
 
             while not vad.empty():
-                # VAD 回调结算
-                manager.process_buffer(is_truncated=False)
+                #  修复 1：异步结算！让主线程立刻滚回去读麦克风，绝不阻塞！
+                threading.Thread(target=manager.process_buffer, args=(False,)).start()
                 vad.pop()
                 
     except KeyboardInterrupt: pass
