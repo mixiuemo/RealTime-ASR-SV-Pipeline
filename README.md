@@ -26,8 +26,6 @@
 
     音频处理：PyAudio & NumPy & ffmpeg。
 
-<img width="2908" height="1782" alt="ScreenShot_2026-05-12_091751_425" src="https://github.com/user-attachments/assets/f9d394f9-33f7-4dd7-8af8-29659a09d3f1" />
-
 
 📂 项目结构
 ```
